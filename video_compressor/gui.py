@@ -1,9 +1,9 @@
 """Графический интерфейс Video Compressor (tkinter/ttk).
 
 Возможности:
+    * чёрный минималистичный дизайн со скруглениями и «мыльными» кнопками;
     * очередь из нескольких файлов с пакетным сжатием;
     * перетаскивание файлов в окно (если установлен tkinterdnd2);
-    * светлая/тёмная темы;
     * прогресс по всем файлам с оставшимся временем;
     * панель «Подробности» с расчётом битрейта и логом FFmpeg;
     * настройки запоминаются между запусками;
@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import logging
 import queue
@@ -25,6 +26,7 @@ import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 try:  # необязательная зависимость: drag & drop файлов
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -50,57 +52,36 @@ from .ffmpeg_tools import download_ffmpeg, find_ffmpeg
 log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# Темы
+# Палитра: чёрный минимализм
 # --------------------------------------------------------------------------- #
 
 PALETTES: dict[str, dict[str, str]] = {
-    "light": {
-        "bg": "#eef2f7",
-        "card": "#ffffff",
-        "border": "#d7dfe9",
-        "text": "#111827",
-        "muted": "#6b7280",
-        "field": "#ffffff",
-        "field_text": "#111827",
-        "btn": "#e7edf5",
-        "btn_hover": "#dbe4ef",
-        "btn_text": "#1f2937",
-        "accent": "#2563eb",
-        "accent_hover": "#1d4ed8",
-        "accent_text": "#ffffff",
-        "accent_disabled": "#93c5fd",
-        "ok": "#15803d",
-        "err": "#dc2626",
-        "warn": "#b45309",
-        "log_bg": "#0f172a",
-        "log_text": "#cbd5e1",
-        "select": "#dbeafe",
-        "select_text": "#111827",
-    },
-    "dark": {
-        "bg": "#0f172a",
-        "card": "#1e293b",
-        "border": "#334155",
-        "text": "#e2e8f0",
-        "muted": "#94a3b8",
-        "field": "#0b1220",
-        "field_text": "#e2e8f0",
-        "btn": "#334155",
-        "btn_hover": "#3b4a61",
-        "btn_text": "#e2e8f0",
-        "accent": "#3b82f6",
-        "accent_hover": "#2563eb",
-        "accent_text": "#ffffff",
-        "accent_disabled": "#1d4ed8",
-        "ok": "#4ade80",
-        "err": "#f87171",
-        "warn": "#fbbf24",
-        "log_bg": "#020617",
-        "log_text": "#94a3b8",
-        "select": "#1e40af",
-        "select_text": "#f8fafc",
+    "black": {
+        "bg": "#000000",
+        "card": "#000000",
+        "line": "#16161b",      # тонкие разделители секций
+        "border": "#24242b",    # кромки полей ввода
+        "text": "#ececf1",
+        "muted": "#77777f",
+        "field": "#08080a",
+        "field_text": "#e5e5e8",
+        "btn": "#0a0a0d",
+        "btn_hover": "#141419",
+        "btn_text": "#d9d9de",
+        "accent": "#7dd3fc",
+        "ok": "#6ee7b7",
+        "err": "#fca5a5",
+        "warn": "#fde68a",
+        "log_bg": "#030304",
+        "log_text": "#8b8b94",
+        "select": "#131a2b",
+        "select_text": "#ececf1",
+        "tip": "#101016",
     },
 }
+
+#: Радужная кромка «мыльного пузырька»: cyan → violet → pink → indigo.
+BUBBLE_COLORS = ("#a5f3fc", "#c4b5fd", "#f0abfc", "#93c5fd")
 
 FONT = ("Segoe UI", 10)
 FONT_BOLD = ("Segoe UI", 10, "bold")
@@ -122,6 +103,297 @@ SIZE_PRESETS = ("8", "10", "16", "25", "50", "100", "250")
 
 SETTINGS_NAME = "VideoCompressor"
 MAX_LOG_LINES = 400
+
+
+# --------------------------------------------------------------------------- #
+# Цвета и фигуры
+# --------------------------------------------------------------------------- #
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+
+
+def blend(a: str, b: str, t: float) -> str:
+    """Линейная интерполяция двух hex-цветов (t: 0 → a, 1 → b)."""
+    ra, ga, ba = _hex_to_rgb(a)
+    rb, gb, bb = _hex_to_rgb(b)
+    t = max(0.0, min(1.0, t))
+    return (
+        f"#{int(ra + (rb - ra) * t):02x}"
+        f"{int(ga + (gb - ga) * t):02x}"
+        f"{int(ba + (bb - ba) * t):02x}"
+    )
+
+
+def dim(color: str, k: float) -> str:
+    """Затемнить цвет к чёрному (k: 0 — чёрный, 1 — исходный)."""
+    return blend("#000000", color, k)
+
+
+def pill_fill(canvas: tk.Canvas, box: tuple, color: str) -> None:
+    """Залитая «таблетка» (скруглённый прямоугольник) внутри box."""
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    if w < h:
+        canvas.create_oval(x0, y0, x1, y1, fill=color, outline="")
+        return
+    canvas.create_rectangle(x0 + h / 2, y0, x1 - h / 2, y1, fill=color, outline="")
+    canvas.create_oval(x0, y0, x0 + h, y1, fill=color, outline="")
+    canvas.create_oval(x1 - h, y0, x1, y1, fill=color, outline="")
+
+
+def pill_stroke(
+    canvas: tk.Canvas,
+    box: tuple,
+    colors: tuple[str, ...] | list[str],
+    width: float,
+) -> None:
+    """Обводка «таблетки» четырьмя элементами с разными цветами (радуга)."""
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    if w < h:
+        canvas.create_oval(x0, y0, x1, y1, outline=colors[0], width=width)
+        return
+    canvas.create_line(x0 + h / 2, y0, x1 - h / 2, y0, fill=colors[0], width=width)
+    canvas.create_line(x0 + h / 2, y1, x1 - h / 2, y1, fill=colors[2], width=width)
+    canvas.create_arc(x0, y0, x0 + h, y1, start=90, extent=180,
+                      style=tk.ARC, outline=colors[3], width=width)
+    canvas.create_arc(x1 - h, y0, x1, y1, start=270, extent=180,
+                      style=tk.ARC, outline=colors[1], width=width)
+
+
+# --------------------------------------------------------------------------- #
+# Кнопки и прогресс: тонкое свечение на чёрном
+# --------------------------------------------------------------------------- #
+
+
+class BubbleButton(tk.Canvas):
+    """Кнопка-«мыльный пузырёк»: скруглая форма, тонкая радужная кромка и мягкое свечение.
+
+    Рисуется на Canvas и потому не зависит от тем оформления tkinter
+    (на Windows их как раз ломает).
+    """
+
+    #: место под внешнее свечение (пиксели с каждой стороны)
+    _PAD = 5
+
+    def __init__(
+        self,
+        parent,
+        text: str = "",
+        command: Callable | None = None,
+        *,
+        palette: dict[str, str],
+        primary: bool = False,
+        font=FONT_BOLD,
+        padx: int = 14,
+        pady: int = 6,
+    ) -> None:
+        self._palette = palette
+        self._primary = primary
+        self._font = font
+        self._padx, self._pady = padx, pady
+        self._opts: dict = {"text": text, "command": command, "state": "normal"}
+        self._hovered = False
+        self._phase = 0.0
+        super().__init__(
+            parent, bg=palette["bg"], highlightthickness=0, bd=0,
+            cursor="hand2", takefocus=0,
+        )
+        self._measure()
+        self.bind("<Configure>", lambda _e: self._draw(), add="+")
+        self.bind("<Enter>", self._on_enter, add="+")
+        self.bind("<Leave>", self._on_leave, add="+")
+        self.bind("<Button-1>", self._on_click, add="+")
+        if primary:
+            self.after(200, self._shimmer)
+
+    # -- размеры ---------------------------------------------------------- #
+
+    def _measure(self) -> None:
+        font = tkfont.Font(font=self._font)
+        text = str(self._opts.get("text", ""))
+        self.configure(
+            width=font.measure(text) + 2 * self._padx + 2 * self._PAD,
+            height=font.metrics("linespace") + 2 * self._pady + 2 * self._PAD,
+        )
+
+    # -- интерфейс, совместимый с tkinter.Widget --------------------------- #
+
+    def configure(self, cnf=None, **kw):  # noqa: D102
+        opts = {**(cnf or {}), **kw}
+        measure = "text" in opts and opts["text"] != self._opts.get("text")
+        self._opts.update(opts)
+        if measure:
+            self._measure()
+        self._draw()
+        return self
+
+    config = configure
+
+    def cget(self, key):
+        if key in self._opts:
+            return self._opts[key]
+        return super().cget(key)
+
+    @property
+    def _enabled(self) -> bool:
+        return self._opts.get("state") != "disabled"
+
+    # -- события ----------------------------------------------------------- #
+
+    def _on_enter(self, _event=None) -> None:
+        if self._enabled:
+            self._hovered = True
+            self._draw()
+
+    def _on_leave(self, _event=None) -> None:
+        if self._hovered:
+            self._hovered = False
+            self._draw()
+
+    def _on_click(self, _event=None) -> None:
+        command = self._opts.get("command")
+        if self._enabled and callable(command):
+            command()
+
+    def _shimmer(self) -> None:
+        """Медленная перетекающая радужная кромка (только у главной кнопки)."""
+        if not self.winfo_exists():
+            return
+        if self._enabled:
+            self._phase = (self._phase + 0.012) % 4.0
+            self._draw()
+        self.after(140, self._shimmer)
+
+    # -- отрисовка ---------------------------------------------------------- #
+
+    def _edge_colors(self) -> list[str]:
+        if not self._enabled:
+            return [dim(c, 0.16) for c in BUBBLE_COLORS]
+        k = int(self._phase) % 4
+        t = self._phase % 1.0
+        cols = [
+            blend(BUBBLE_COLORS[(k + i) % 4], BUBBLE_COLORS[(k + i + 1) % 4], t)
+            for i in range(4)
+        ]
+        # яркость: главная кнопка → ярче, при наведении → ещё ярче
+        keep = 0.78 if self._primary else 0.5
+        if self._hovered:
+            keep = min(1.0, keep + 0.2)
+        return [dim(c, keep) for c in cols]
+
+    def _draw(self) -> None:
+        if not self.winfo_exists():
+            return
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 2 * self._PAD or h <= 2 * self._PAD:
+            return
+        self.delete("all")
+        p = self._palette
+        box = (self._PAD, self._PAD, w - self._PAD, h - self._PAD)
+        cols = self._edge_colors()
+        fill = p["btn_hover"] if self._enabled and self._hovered else p["btn"]
+
+        # внешнее свечение: два слоя, затухающие к чёрному
+        for width, keep in ((4.5, 0.34), (2.5, 0.16)):
+            pill_stroke(self, box, [dim(c, keep) for c in cols], width)
+        pill_fill(self, box, fill)
+        pill_stroke(self, box, cols, 1)
+
+        if not self._enabled:
+            text_fill = "#3a3a42"
+        elif self._primary:
+            text_fill = "#f2f3f5"
+        else:
+            text_fill = p["btn_text"]
+        self.create_text(
+            w / 2, h / 2, text=str(self._opts.get("text", "")),
+            font=self._font, fill=text_fill,
+        )
+
+
+class GlowProgress(tk.Canvas):
+    """Тонкий скруглённый индикатор прогресса со свечением."""
+
+    _PAD = 5
+
+    def __init__(self, parent, *, palette: dict[str, str], height: int = 16, **kw) -> None:
+        self._palette = palette
+        self._opts: dict = {"value": 0.0, "maximum": 1.0, "mode": "determinate"}
+        self._anim = 0.0
+        self._after_id: str | None = None
+        self._interval = 50
+        super().__init__(parent, bg=palette["bg"], highlightthickness=0, bd=0, height=height)
+        self.bind("<Configure>", lambda _e: self._draw(), add="+")
+
+    def configure(self, cnf=None, **kw):  # noqa: D102
+        self._opts.update({**(cnf or {}), **kw})
+        if self._opts.get("mode") != "indeterminate":
+            self._stop_anim()
+        self._draw()
+        return self
+
+    config = configure
+
+    def cget(self, key):
+        return self._opts.get(key)
+
+    def start(self, interval: int = 50) -> None:
+        self._interval = max(40, interval)
+        if self._after_id is None and self._opts.get("mode") == "indeterminate":
+            self._after_id = self.after(self._interval, self._tick)
+
+    def stop(self) -> None:
+        self._stop_anim()
+        self._draw()
+
+    def _stop_anim(self) -> None:
+        if self._after_id is not None:
+            with contextlib.suppress(tk.TclError):
+                self.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _tick(self) -> None:
+        self._after_id = None
+        if not self.winfo_exists() or self._opts.get("mode") != "indeterminate":
+            return
+        self._anim = (self._anim + 0.07) % 1.35
+        self._draw()
+        self._after_id = self.after(self._interval, self._tick)
+
+    def _draw(self) -> None:
+        if not self.winfo_exists():
+            return
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 2 * self._PAD or h <= 4:
+            return
+        self.delete("all")
+        p = self._palette
+        box = (self._PAD, self._PAD, w - self._PAD, h - self._PAD)
+        pill_fill(self, box, "#0b0b0f")                      # дорожка
+        pill_stroke(self, box, [p["border"]] * 4, 1)         # её кромка
+
+        mode = self._opts.get("mode")
+        if mode == "indeterminate":
+            lo, hi = self._anim - 0.3, self._anim
+            if hi <= 0 or lo >= 1:
+                return
+            frac0, frac1 = max(0.0, lo), min(1.0, hi)
+        else:
+            value = float(self._opts.get("value") or 0.0)
+            maximum = float(self._opts.get("maximum") or 1.0) or 1.0
+            frac0, frac1 = 0.0, max(0.0, min(value / maximum, 1.0))
+            if frac1 <= 0:
+                return
+
+        bw = box[2] - box[0]
+        sub = (box[0] + bw * frac0, box[1], box[0] + bw * frac1, box[3])
+        color = blend(BUBBLE_COLORS[0], BUBBLE_COLORS[1], 0.35)
+        pill_stroke(self, sub, [dim(color, 0.7)] * 4, 4)      # свечение заливки
+        pill_fill(self, sub, color)
+        pill_stroke(self, sub, [dim(color, 1.0)] * 4, 1)      # тонкая кромка
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +454,7 @@ class Tooltip:
         tk.Label(
             tip,
             text=self.text,
-            bg=p["card"],
+            bg=p["tip"],
             fg=p["muted"],
             font=FONT_SMALL,
             relief="solid",
@@ -239,13 +511,9 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.settings = load_settings()
-        self.theme_name = self.settings.get("theme", "light")
-        if self.theme_name not in PALETTES:
-            self.theme_name = "light"
-        self.palette = PALETTES[self.theme_name]
+        self.palette = PALETTES["black"]
+        self.configure(background=self.palette["bg"])
 
-        self._themed: list[tuple[tk.Widget, str, str | None]] = []
-        self._combos: list[ttk.Combobox] = []
         self._events: queue.Queue[tuple] = queue.Queue()
         self._cancel_event = threading.Event()
         self._busy = False
@@ -269,20 +537,18 @@ class App(tk.Tk):
         self.var_status = tk.StringVar(value="Готово к работе")
         self.var_result = tk.StringVar(value="")        # итог после пакета
         self.var_ffmpeg = tk.StringVar(value="")
-        self.var_theme_btn = tk.StringVar(
-            value="Тёмная тема" if self.theme_name == "light" else "Светлая тема"
-        )
         self.var_details = tk.BooleanVar(value=False)
 
         self.title(f"Video Compressor {__version__}")
         self.minsize(760, 660)
         self.geometry(self.settings.get("geometry", "760x660"))
 
+        self._setup_styles()
         self._build_ui()
-        self._apply_theme()
         self._bind_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self.after(120, self._round_window)
         self.after(300, self._check_ffmpeg)
         self.after(150, self._enable_dnd)
         self.after(100, self._poll_events)
@@ -291,20 +557,16 @@ class App(tk.Tk):
     # Построение интерфейса
     # --------------------------------------------------------------------- #
 
-    def _reg(self, widget: tk.Widget, bg_role: str, fg_role: str | None = None) -> tk.Widget:
-        """Зарегистрировать tk-виджет для перекраски при смене темы."""
-        self._themed.append((widget, bg_role, fg_role))
-        return widget
-
     def _frame(self, parent, bg_role: str = "bg", **kw) -> tk.Frame:
-        return self._reg(tk.Frame(parent, bg=self.palette[bg_role], **kw), bg_role)  # type: ignore[return-value]
+        return tk.Frame(parent, bg=self.palette[bg_role], **kw)  # type: ignore[return-value]
 
-    def _label(self, parent, text: str = "", bg_role: str = "bg", fg_role: str = "text", **kw) -> tk.Label:
-        lbl = tk.Label(
+    def _label(
+        self, parent, text: str = "", bg_role: str = "bg", fg_role: str = "text", **kw
+    ) -> tk.Label:
+        return tk.Label(
             parent, text=text, bg=self.palette[bg_role], fg=self.palette[fg_role],
             font=kw.pop("font", FONT), **kw,
-        )
-        return self._reg(lbl, bg_role, fg_role)  # type: ignore[return-value]
+        )  # type: ignore[return-value]
 
     def _button(
         self,
@@ -314,29 +576,12 @@ class App(tk.Tk):
         *,
         primary: bool = False,
         font=FONT_BOLD,
-    ) -> tk.Button:
-        """Плоская кнопка с гарантированно рабочими цветами в любой теме."""
-        role = "accent" if primary else "btn"
-        fg_role = "accent_text" if primary else "btn_text"
-        btn = tk.Button(
-            parent,
-            text=text,
-            command=command,
-            font=font,
-            relief="flat",
-            bd=0,
-            padx=18 if primary else 12,
-            pady=7 if primary else 6,
-            bg=self.palette[role],
-            fg=self.palette[fg_role],
-            activebackground=self.palette[role + "_hover"],
-            activeforeground=self.palette[fg_role],
-            disabledforeground=self.palette["accent_disabled" if primary else "muted"],
-            cursor="hand2",
-            highlightthickness=0,
+    ) -> BubbleButton:
+        """Кнопка-«пузырёк»: скругление, тонкая радужная кромка, свечение."""
+        return BubbleButton(
+            parent, text, command, palette=self.palette, primary=primary, font=font,
+            padx=22 if primary else 14, pady=8 if primary else 6,
         )
-        self._themed.append((btn, role, fg_role))
-        return btn  # type: ignore[return-value]
 
     def _card(
         self,
@@ -347,24 +592,20 @@ class App(tk.Tk):
         sticky: str = "ew",
         pady: tuple[int, int] = (0, 10),
     ) -> tk.Frame:
-        """Белая карточка с однопиксельной рамкой; размещается сразу через grid."""
+        """Секция без рамки: заголовок, тонкая линия и контент на чёрном фоне."""
         p = self.palette
-        shell = tk.Frame(parent, bg=p["border"])
-        self._reg(shell, "border")
-        shell.grid(row=row, column=0, sticky=sticky, padx=18, pady=pady)
-        inner = tk.Frame(shell, bg=p["card"], padx=14, pady=12)
-        self._reg(inner, "card")
-        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        body = tk.Frame(parent, bg=p["bg"])
+        body.grid(row=row, column=0, sticky=sticky, padx=24, pady=pady)
         if title:
-            self._label(inner, title, "card", "text", font=FONT_BOLD).pack(
-                anchor="w", pady=(0, 4)
-            )
+            self._label(
+                body, title.upper(), "bg", "muted", font=("Segoe UI", 9, "bold")
+            ).pack(anchor="w")
+            tk.Frame(body, bg=p["line"], height=1).pack(fill="x", pady=(7, 10))
         # Отдельный контейнер под содержимое: к нему можно применять grid,
         # не конфликтуя с pack-заголовком.
-        body = tk.Frame(inner, bg=p["card"])
-        self._reg(body, "card")
-        body.pack(fill="both", expand=True)
-        return body  # type: ignore[return-value]
+        content = tk.Frame(body, bg=p["bg"])
+        content.pack(fill="both", expand=True)
+        return content  # type: ignore[return-value]
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -372,7 +613,7 @@ class App(tk.Tk):
 
         # ---- Шапка ---- #
         header = self._frame(self, "bg")
-        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 10))
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 12))
         header.columnconfigure(0, weight=1)
         self._label(header, f"Video Compressor {__version__}", "bg", "text", font=FONT_TITLE).grid(
             row=0, column=0, sticky="w"
@@ -380,11 +621,6 @@ class App(tk.Tk):
         self._label(
             header, "Сжатие видео точно в заданный размер", "bg", "muted", font=FONT_SMALL
         ).grid(row=1, column=0, sticky="w")
-        self._button(
-            header, "", self._toggle_theme, font=FONT_SMALL
-        ).grid(row=0, column=1, rowspan=2, sticky="e")
-        theme_btn = self._themed[-1][0]
-        theme_btn.configure(textvariable=self.var_theme_btn)  # type: ignore[attr-defined]
 
         # ---- Карточка: файлы ---- #
         card_files = self._card(self, "Видеофайлы", row=1)
@@ -440,7 +676,6 @@ class App(tk.Tk):
         combo_size = ttk.Combobox(size_box, textvariable=self.var_size, values=SIZE_PRESETS,
                                   width=8, font=FONT)
         combo_size.pack(side="left")
-        self._combos.append(combo_size)
         self._label(size_box, "МБ", "card", "muted").pack(side="left", padx=(6, 0))
         Tooltip(combo_size, "Сколько МБ должно получиться в итоге", self.get_palette)
 
@@ -449,7 +684,6 @@ class App(tk.Tk):
         combo_speed = ttk.Combobox(grid, textvariable=self.var_speed, values=list(SPEED_CHOICES),
                                    state="readonly", width=24, font=FONT)
         combo_speed.grid(row=0, column=3, sticky="w")
-        self._combos.append(combo_speed)
         Tooltip(combo_speed, "Быстрее — меньше сжатие; медленнее — лучшее качество при том же размере",
                 self.get_palette)
 
@@ -475,7 +709,7 @@ class App(tk.Tk):
         bar_row = self._frame(card_run, "card")
         bar_row.grid(row=0, column=0, sticky="ew", pady=(8, 0))
         bar_row.columnconfigure(0, weight=1)
-        self.progress = ttk.Progressbar(bar_row, maximum=1.0)
+        self.progress = GlowProgress(bar_row, palette=self.palette)
         self.progress.grid(row=0, column=0, sticky="ew")
         self._label(bar_row, "", "card", "text", font=FONT_BOLD, textvariable=self.var_percent,
                     width=6, anchor="e").grid(row=0, column=1, padx=(10, 0))
@@ -508,8 +742,6 @@ class App(tk.Tk):
             insertbackground=self.palette["log_text"], highlightthickness=0,
             padx=10, pady=8,
         )
-        self._reg(log_box, "card")
-        self._themed.append((self.log_text, "log_bg", "log_text"))
         vsb2 = ttk.Scrollbar(log_box, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=vsb2.set)
         self.log_text.pack(side="left", fill="both", expand=True)
@@ -518,7 +750,7 @@ class App(tk.Tk):
 
         # ---- Нижняя панель: действие + итог ---- #
         actions = self._frame(self, "bg")
-        actions.grid(row=4, column=0, sticky="ew", padx=18, pady=(2, 8))
+        actions.grid(row=4, column=0, sticky="ew", padx=24, pady=(4, 8))
         actions.columnconfigure(1, weight=1)
         self.btn_compress = self._button(
             actions, "Сжать видео", self._start, primary=True, font=("Segoe UI", 11, "bold")
@@ -540,13 +772,13 @@ class App(tk.Tk):
         self.result_box.grid_remove()  # появится после успешного пакета
 
         hint = self._frame(self, "bg")
-        hint.grid(row=5, column=0, sticky="ew", padx=18)
+        hint.grid(row=5, column=0, sticky="ew", padx=24)
         self._label(hint, "Enter — сжать · Esc — отмена · Ctrl+O — добавить файлы",
                     "bg", "muted", font=FONT_SMALL).pack(anchor="w")
 
         # ---- Статусбар ---- #
         bar = self._frame(self, "bg")
-        bar.grid(row=6, column=0, sticky="ew", padx=18, pady=(6, 10))
+        bar.grid(row=6, column=0, sticky="ew", padx=24, pady=(6, 12))
         bar.columnconfigure(0, weight=1)
         self._label(bar, "", "bg", "text", font=FONT_SMALL, textvariable=self.var_status)\
             .grid(row=0, column=0, sticky="w")
@@ -554,116 +786,71 @@ class App(tk.Tk):
                                       textvariable=self.var_ffmpeg)
         self.lbl_ffmpeg.grid(row=0, column=1, sticky="e")
 
+        # Цвета статусов в списке файлов
+        self.tree.tag_configure("ok", foreground=self.palette["ok"])
+        self.tree.tag_configure("err", foreground=self.palette["err"])
+        self.tree.tag_configure("muted", foreground=self.palette["muted"])
+        self.tree.tag_configure("busy", foreground=self.palette["warn"])
+
         self._refresh_files_summary()
 
     # --------------------------------------------------------------------- #
-    # Тема и стиль
+    # Стиль
     # --------------------------------------------------------------------- #
 
     def get_palette(self) -> dict[str, str]:
         return self.palette
 
-    def _apply_theme(self) -> None:
+    def _setup_styles(self) -> None:
+        """Единая чёрная тема ttk; вызывается один раз до построения виджетов."""
         p = self.palette
         style = ttk.Style(self)
         style.theme_use("clam")
-
-        # tk-виджеты
-        for widget, bg_role, fg_role in self._themed:
-            cfg: dict[str, str] = {"bg": p[bg_role]}
-            if fg_role:
-                if isinstance(widget, tk.Button) and fg_role == "btn_text":
-                    cfg["fg"] = p["btn_text"]
-                    cfg["activebackground"] = p["btn_hover"]
-                    cfg["activeforeground"] = p["btn_text"]
-                elif isinstance(widget, tk.Button) and fg_role == "accent_text":
-                    cfg["fg"] = p["accent_text"]
-                    cfg["activebackground"] = p["accent_hover"]
-                    cfg["activeforeground"] = p["accent_text"]
-                else:
-                    cfg["fg"] = p[fg_role]
-            with contextlib.suppress(tk.TclError):
-                widget.configure(**cfg)
-
-        # ttk-виджеты
         style.configure(".", background=p["bg"], foreground=p["text"], font=FONT)
         style.configure("TFrame", background=p["bg"])
         style.configure("TLabel", background=p["bg"], foreground=p["text"])
-        style.configure("TButton", background=p["btn"], foreground=p["btn_text"],
-                        bordercolor=p["border"], lightcolor=p["btn"], darkcolor=p["btn"],
-                        focusthickness=1, relief="flat", padding=(10, 5), font=FONT)
-        style.map("TButton",
-                  background=[("active", p["btn_hover"]), ("disabled", p["bg"])],
-                  foreground=[("disabled", p["muted"])])
         style.configure("TEntry", fieldbackground=p["field"], foreground=p["field_text"],
                         insertcolor=p["text"], bordercolor=p["border"],
-                        lightcolor=p["border"], darkcolor=p["border"], relief="flat")
+                        lightcolor=p["border"], darkcolor=p["border"], relief="flat", padding=6)
         style.configure("TCombobox", fieldbackground=p["field"], foreground=p["field_text"],
                         arrowcolor=p["muted"], bordercolor=p["border"],
-                        lightcolor=p["border"], darkcolor=p["border"], relief="flat")
+                        lightcolor=p["border"], darkcolor=p["border"], relief="flat", padding=6)
         style.map("TCombobox",
                   fieldbackground=[("readonly", p["field"])],
                   foreground=[("readonly", p["field_text"])],
                   selectbackground=[("readonly", p["field"])],
                   selectforeground=[("readonly", p["field_text"])])
-        style.configure("TCheckbutton", background=p["card"], foreground=p["text"],
-                        indicatorcolor=p["field"])
-        style.map("TCheckbutton", background=[("active", p["card"])],
+        style.configure("TCheckbutton", background=p["bg"], foreground=p["muted"],
+                        indicatorcolor=p["border"])
+        style.map("TCheckbutton", background=[("active", p["bg"])],
                   indicatorcolor=[("selected", p["accent"])])
-        style.configure("Horizontal.TProgressbar", troughcolor=p["border"],
-                        background=p["accent"], thickness=16)
-        style.configure("Vertical.TScrollbar", background=p["btn"], troughcolor=p["card"],
-                        arrowcolor=p["muted"], bordercolor=p["card"])
-        style.configure("Treeview", background=p["card"], fieldbackground=p["card"],
-                        foreground=p["text"], font=FONT, rowheight=26)
-        style.configure("Treeview.Heading", background=p["btn"], foreground=p["muted"],
+        style.configure("Vertical.TScrollbar", background=p["btn"], troughcolor=p["bg"],
+                        arrowcolor=p["muted"], bordercolor=p["bg"])
+        style.configure("Treeview", background=p["bg"], fieldbackground=p["bg"],
+                        foreground=p["text"], font=FONT, rowheight=26, borderwidth=0)
+        style.configure("Treeview.Heading", background=p["bg"], foreground="#55555d",
                         font=FONT_SMALL, relief="flat")
         style.map("Treeview", background=[("selected", p["select"])],
                   foreground=[("selected", p["select_text"])])
 
-        self.tree.tag_configure("ok", foreground=p["ok"])
-        self.tree.tag_configure("err", foreground=p["err"])
-        self.tree.tag_configure("muted", foreground=p["muted"])
-        self.tree.tag_configure("busy", foreground=p["warn"])
-
-        # Лог
-        self.log_text.configure(bg=p["log_bg"], fg=p["log_text"], insertbackground=p["log_text"])
-
-        # Выпадающие списки комбобоксов (перекраска через Tcl: tkinter не
-        # регистрирует popdown-виджет на своей стороне)
+        # Выпадающий список комбобокса (создаётся Tcl'ом — красим option db)
         self.option_add("*TCombobox*Listbox.background", p["field"])
         self.option_add("*TCombobox*Listbox.foreground", p["field_text"])
         self.option_add("*TCombobox*Listbox.selectBackground", p["select"])
         self.option_add("*TCombobox*Listbox.selectForeground", p["select_text"])
-        for combo in self._combos:
-            with contextlib.suppress(tk.TclError):
-                self._recolor_listbox(combo, p)
 
-        self.configure(bg=p["bg"])
-
-    def _recolor_listbox(self, combo: ttk.Combobox, p: dict[str, str]) -> None:
-        """Перекрасить выпадающий список комбобокса, если он уже создан."""
-        popdown = self.tk.call("ttk::combobox::PopdownWindow", combo)
-        stack = [popdown]
-        while stack:
-            widget = stack.pop()
-            if self.tk.call("winfo", "class", widget) == "Listbox":
-                self.tk.call(
-                    widget, "configure",
-                    "-background", p["field"],
-                    "-foreground", p["field_text"],
-                    "-selectbackground", p["select"],
-                    "-selectforeground", p["select_text"],
-                )
-            children = self.tk.call("winfo", "children", widget)
-            stack.extend(self.tk.splitlist(children))
-
-    def _toggle_theme(self) -> None:
-        self.theme_name = "dark" if self.theme_name == "light" else "light"
-        self.palette = PALETTES[self.theme_name]
-        self.var_theme_btn.set("Тёмная тема" if self.theme_name == "light" else "Светлая тема")
-        self._apply_theme()
-        self._save_settings_partial()
+    def _round_window(self) -> None:
+        """Скруглить углы окна через DWM (Windows 11; на старых — тихо игнорируется)."""
+        if sys.platform != "win32":
+            return
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            pref = ctypes.c_int(2)  # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref)
+            )
+        except (AttributeError, OSError):  # pragma: no cover
+            log.debug("Скругление углов недоступно")
 
     # --------------------------------------------------------------------- #
     # Настройки, подсказки, горячие клавиши
@@ -671,7 +858,6 @@ class App(tk.Tk):
 
     def _save_settings_partial(self) -> None:
         save_settings({
-            "theme": self.theme_name,
             "size": self.var_size.get(),
             "speed": self.var_speed.get(),
             "output_dir": self.var_outdir.get(),
@@ -770,7 +956,7 @@ class App(tk.Tk):
             added += 1
         if added:
             self.var_result.set("")
-            self.result_box.pack_forget()
+            self.result_box.grid_remove()
             self.log_clear()
             self._refresh_files_summary()
             self._update_estimate()
