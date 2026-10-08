@@ -176,7 +176,7 @@ class BubbleButton(tk.Canvas):
     """
 
     #: место под внешнее свечение (пиксели с каждой стороны)
-    _PAD = 5
+    _PAD = 4
 
     def __init__(
         self,
@@ -187,13 +187,14 @@ class BubbleButton(tk.Canvas):
         palette: dict[str, str],
         primary: bool = False,
         font=FONT_BOLD,
-        padx: int = 14,
-        pady: int = 6,
+        hpad: int = 14,
+        pill_height: int = 24,
     ) -> None:
         self._palette = palette
         self._primary = primary
         self._font = font
-        self._padx, self._pady = padx, pady
+        self._hpad = hpad
+        self._pill_height = pill_height
         self._opts: dict = {"text": text, "command": command, "state": "normal"}
         self._hovered = False
         self._phase = 0.0
@@ -214,17 +215,19 @@ class BubbleButton(tk.Canvas):
     def _measure(self) -> None:
         font = tkfont.Font(font=self._font)
         text = str(self._opts.get("text", ""))
-        self.configure(
-            width=font.measure(text) + 2 * self._padx + 2 * self._PAD,
-            height=font.metrics("linespace") + 2 * self._pady + 2 * self._PAD,
-        )
+        pill_w = font.measure(text) + 2 * self._hpad
+        pill_h = max(self._pill_height, font.metrics("linespace") + 8)
+        self.configure(width=pill_w + 2 * self._PAD, height=pill_h + 2 * self._PAD)
 
     # -- интерфейс, совместимый с tkinter.Widget --------------------------- #
 
     def configure(self, cnf=None, **kw):  # noqa: D102
         opts = {**(cnf or {}), **kw}
-        measure = "text" in opts and opts["text"] != self._opts.get("text")
-        self._opts.update(opts)
+        internal = {k: opts.pop(k) for k in list(opts) if k in ("text", "command", "state")}
+        measure = "text" in internal and internal["text"] != self._opts.get("text")
+        self._opts.update(internal)
+        if opts:
+            super().configure(**opts)   # width/height и прочее — в сам canvas
         if measure:
             self._measure()
         self._draw()
@@ -580,7 +583,8 @@ class App(tk.Tk):
         """Кнопка-«пузырёк»: скругление, тонкая радужная кромка, свечение."""
         return BubbleButton(
             parent, text, command, palette=self.palette, primary=primary, font=font,
-            padx=22 if primary else 14, pady=8 if primary else 6,
+            hpad=24 if primary else 14,
+            pill_height=32 if primary else 24,
         )
 
     def _card(
@@ -711,7 +715,7 @@ class App(tk.Tk):
         bar_row.columnconfigure(0, weight=1)
         self.progress = GlowProgress(bar_row, palette=self.palette)
         self.progress.grid(row=0, column=0, sticky="ew")
-        self._label(bar_row, "", "card", "text", font=FONT_BOLD, textvariable=self.var_percent,
+        self._label(bar_row, "", "card", "accent", font=FONT_BOLD, textvariable=self.var_percent,
                     width=6, anchor="e").grid(row=0, column=1, padx=(10, 0))
 
         stage_row = self._frame(card_run, "card")
