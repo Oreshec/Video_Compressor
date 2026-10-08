@@ -10,8 +10,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/3] Установка PyInstaller и tkinterdnd2...
-python -m pip install --upgrade pyinstaller tkinterdnd2 >nul || goto :fail
+echo [1/3] Установка зависимостей и PyInstaller...
+python -m pip install --upgrade pyinstaller "dearpygui>=2.3" >nul || goto :fail
 
 echo [2/3] Сборка VideoCompressor.exe...
 python -m PyInstaller VideoCompressor.spec --noconfirm --clean --log-level WARN || goto :fail

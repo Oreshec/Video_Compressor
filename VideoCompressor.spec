@@ -9,23 +9,17 @@ FFmpeg программе не нужен «в коробке»: при перв
 предложит скачать его рядом с exe (папка ffmpeg\\).
 """
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_all
 
-# Tcl/Tk-расширение tkdnd (drag & drop) — если установлено, попадает в exe;
-# без него программа просто работает без перетаскивания.
-try:
-    dnd_datas = collect_data_files("tkinterdnd2")
-    dnd_hidden = ["tkinterdnd2", "tkinterdnd2.TkinterDnD"]
-except Exception:  # noqa: BLE001 — сборка возможна и без tkinterdnd2
-    dnd_datas = []
-    dnd_hidden = []
+# Dear PyGui — скомпилированный модуль + ресурсы (шрифты, shaders): собираем всё.
+dpg_datas, dpg_binaries, dpg_hidden = collect_all("dearpygui")
 
 a = Analysis(
     ["gui_compressor.py"],
     pathex=[],
-    binaries=[],
-    datas=dnd_datas,
-    hiddenimports=dnd_hidden,
+    binaries=dpg_binaries,
+    datas=dpg_datas,
+    hiddenimports=dpg_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,6 +29,8 @@ a = Analysis(
         "unittest",
         "pydoc",
         "pydoc_data",
+        "tkinter",
+        "_tkinter",
     ],
     noarchive=False,
 )

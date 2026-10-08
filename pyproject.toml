@@ -16,13 +16,11 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Multimedia :: Video :: Conversion",
 ]
-# Рантайм полностью на стандартной библиотеке — зависимостей нет.
-dependencies = []
+# Ядро и CLI — стандартная библиотека; GUI рисует через Dear PyGui.
+dependencies = ["dearpygui>=2.3"]
 
 [project.optional-dependencies]
-# dragdrop — перетаскивание файлов в окно (в exe включается при сборке)
-dragdrop = ["tkinterdnd2>=0.3"]
-dev = ["pytest>=7.4", "ruff>=0.4", "pyinstaller>=6.0", "tkinterdnd2>=0.3"]
+dev = ["pytest>=7.4", "ruff>=0.4", "pyinstaller>=6.0"]
 
 [project.urls]
 Homepage = "https://github.com/Oreshec/Video_Compressor"
