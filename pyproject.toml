@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-compressor"
+version = "2.0.0"
+description = "Сжатие видео до заданного размера с автоматическим подбором битрейта (FFmpeg)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Oreshec" }]
+keywords = ["video", "compress", "ffmpeg", "bitrate"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Video :: Conversion",
+]
+# Рантайм полностью на стандартной библиотеке — зависимостей нет.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "ruff>=0.4", "pyinstaller>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/Oreshec/Video_Compressor"
+
+[project.scripts]
+video-compressor = "video_compressor.cli:main"
+video-compressor-gui = "video_compressor.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["video_compressor*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["video_compressor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+ignore = ["E501"]  # длинные строки допустимы в комментариях/путях
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

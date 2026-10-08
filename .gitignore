@@ -1,1 +1,21 @@
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+
+# Инструменты
+.pytest_cache/
+.ruff_cache/
+
+# Сборка exe
+build/
+dist/
+
+# Скачанный FFmpeg (~110 МБ) — в репозиторий не попадает
+ffmpeg/
+
+# Результаты сжатия
+*_compressed.*

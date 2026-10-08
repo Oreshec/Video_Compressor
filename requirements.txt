@@ -1,4 +1,0 @@
-# Для работы скрипта достаточно стандартной библиотеки Python 3.
-# Обязательно установите FFmpeg и добавьте его в PATH:
-# https://ffmpeg.org/download.html
-# Windows: choco install ffmpeg  или скачайте с https://www.gyan.dev/ffmpeg/builds/
