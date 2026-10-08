@@ -236,6 +236,8 @@ class App:
         self._last_output: Path | None = None
         self._log_lines: list[str] = []
         self._alert_seq = 0
+        self._alert_tag: str | None = None
+        self._pending_alerts: list[tuple[str, str]] = []
         self._check_on_start = check_ffmpeg
 
         # Шрифты; если системные не найдены — остаётся None.
@@ -511,8 +513,14 @@ class App:
     # ------------------------------------------------------------------ #
 
     def _alert(self, title: str, text: str) -> None:
+        # Dear PyGui не показывает вторую модалку поверх открытой, поэтому
+        # откладываем алерт и показываем, когда текущая модалка закроется.
+        if self._modal_open():
+            self._pending_alerts.append((title, text))
+            return
         self._alert_seq += 1
         tag = f"alert_{self._alert_seq}"
+        self._alert_tag = tag
         with dpg.window(
             modal=True,
             label=title,
@@ -526,9 +534,26 @@ class App:
             dpg.add_button(
                 label="OK",
                 width=90,
-                callback=lambda *_: dpg.delete_item(tag),
+                callback=lambda *_: (dpg.delete_item(tag), self._alert_closed()),
             )
         dpg.show_item(tag)
+
+    def _modal_open(self) -> bool:
+        """Открыта ли сейчас какая-нибудь модалка (FFmpeg или алерт)."""
+        if dpg.does_item_exist("ffmpeg_dialog"):
+            return True
+        return self._alert_tag is not None and dpg.does_item_exist(self._alert_tag)
+
+    def _alert_closed(self, *_args) -> None:
+        self._alert_tag = None
+        self._flush_alerts()
+
+    def _flush_alerts(self) -> None:
+        """Показать первый отложенный алерт, когда модалок нет."""
+        if not self._pending_alerts or self._modal_open():
+            return
+        title, text = self._pending_alerts.pop(0)
+        self.after(50, lambda: self._alert(title, text))
 
     def _choose_outdir(self, *_args) -> None:
         tag = "outdir_dialog"
@@ -628,6 +653,9 @@ class App:
 
     def _add_files(self, *_args) -> None:
         if self._busy:
+            dpg.configure_item(
+                self.lbl_status, default_value="Дождитесь завершения текущей операции"
+            )
             return
         self._append_paths(pick_video_files())
 
@@ -927,6 +955,8 @@ class App:
     # ------------------------------------------------------------------ #
 
     def _poll_events(self) -> None:
+        if self._pending_alerts:
+            self._flush_alerts()
         try:
             while True:
                 self._handle_event(self._events.get_nowait())
