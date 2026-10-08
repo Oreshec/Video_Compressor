@@ -21,7 +21,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install PyInstaller
-        run: pip install pyinstaller
+        run: pip install pyinstaller tkinterdnd2
 
       - name: Build EXE
         run: python -m PyInstaller VideoCompressor.spec --noconfirm --clean

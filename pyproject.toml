@@ -20,7 +20,9 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4", "ruff>=0.4", "pyinstaller>=6.0"]
+# dragdrop — перетаскивание файлов в окно (в exe включается при сборке)
+dragdrop = ["tkinterdnd2>=0.3"]
+dev = ["pytest>=7.4", "ruff>=0.4", "pyinstaller>=6.0", "tkinterdnd2>=0.3"]
 
 [project.urls]
 Homepage = "https://github.com/Oreshec/Video_Compressor"
