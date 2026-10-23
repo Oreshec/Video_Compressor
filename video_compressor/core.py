@@ -6,13 +6,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
 import re
 import subprocess
 import sys
+import tempfile
 import threading
+import uuid
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -60,11 +63,45 @@ MIN_VIDEO_BITRATE_BPS = 50_000
 #: Максимальное число повторных прогонов, если результат не влез в лимит.
 MAX_ATTEMPTS = 3
 
+#: Максимальное число повторных прогонов, если результат не влез в лимит.
+MAX_ATTEMPTS = 3
+
+#: Кодеки аудио, совместимые с контейнером MP4: если исходный битрейт аудио
+#: умещается в бюджет, поток выгодно скопировать, а не перекодировать.
+MP4_AUDIO_COPY_CODECS = frozenset({"aac", "mp3", "alac", "ac3", "eac3"})
+
+#: Целевые биты на пиксель кадра: ниже планки качество «плывёт», выгоднее
+#: уменьшить разрешение и дать каждому пикселю больше битов.
+TARGET_BITS_PER_PIXEL = 0.06
+
+#: Лестница высот для авторесолюшна (используется только вниз от источника).
+SCALE_LADDER = (2160, 1440, 1080, 720, 540, 480)
+
 #: Пресеты скорости libx264 (скорость ↔ сжатие).
 ENCODER_PRESETS = (
     "ultrafast", "superfast", "veryfast", "faster", "fast",
     "medium", "slow", "slower", "veryslow",
 )
+
+#: Поддерживаемые кодировщики: CPU x264 и аппаратные h264-ветки.
+ENCODERS = ("libx264", "h264_nvenc", "h264_qsv", "h264_amf")
+
+#: Пресет аппаратного кодера для каждого пресета libx264.
+_HW_PRESETS: dict[str, dict[str, str]] = {
+    "h264_nvenc": {
+        "ultrafast": "p1", "superfast": "p2", "veryfast": "p4", "faster": "p4",
+        "fast": "p5", "medium": "p5", "slow": "p6", "slower": "p7", "veryslow": "p7",
+    },
+    "h264_qsv": {},  # понимает те же имена пресетов, что libx264
+    "h264_amf": {
+        "ultrafast": "speed", "superfast": "speed", "veryfast": "speed", "faster": "speed",
+        "fast": "speed", "medium": "balanced", "slow": "quality", "slower": "quality",
+        "veryslow": "quality",
+    },
+}
+
+#: Куда направлять вывод первого прохода двухпроходного кодирования.
+_NULL_OUTPUT = "NUL" if sys.platform == "win32" else "/dev/null"
 
 ProgressCallback = Callable[[float | None, str], None]
 """Колбэк прогресса: ``(доля 0..1 или None, описание этапа)``."""
@@ -113,6 +150,8 @@ class CompressionPlan:
     video_bitrate_bps: int
     audio_bitrate_bps: int
     estimated_size_mb: float
+    #: True — исходный аудиопоток умещается в бюджет и копируется без потерь.
+    audio_copy: bool = False
 
     @property
     def video_bitrate_kbps(self) -> int:
@@ -129,6 +168,10 @@ class CompressionResult:
     actual_size_mb: float
     plan: CompressionPlan
     attempts: int = 1
+    #: Кодировщик, которым реально записан файл (после возможного фолбэка).
+    encoder: str = "libx264"
+    #: Высота результата, если включалось уменьшение разрешения.
+    output_height: int | None = None
 
     @property
     def fits_target(self) -> bool:
@@ -172,6 +215,59 @@ def _require_ffmpeg() -> tuple[Path, Path]:
             "или разрешите программе скачать автоматически."
         )
     return tools.ffmpeg, tools.ffprobe
+
+
+_avail_encoders: set[str] | None = None
+
+
+def available_encoders(*, refresh: bool = False) -> set[str]:
+    """Какие кодировщики собраны в этой сборке FFmpeg (кэшируется).
+
+    Дёшево: один вызов ``ffmpeg -encoders`` и поиск по списку. Наличие
+    кодировщика не гарантирует работоспособность железа — для проверки
+    есть :func:`usable_hw_encoders`.
+    """
+    global _avail_encoders
+    if _avail_encoders is not None and not refresh:
+        return _avail_encoders
+    try:
+        ffmpeg, _ = _require_ffmpeg()
+        out = _run([str(ffmpeg), "-hide_banner", "-encoders"])
+        text = out.stdout or ""
+        _avail_encoders = {enc for enc in ENCODERS if enc in text}
+    except (VideoCompressorError, OSError):
+        _avail_encoders = set()
+    return _avail_encoders
+
+
+def _encoder_works(ffmpeg: Path, encoder: str) -> bool:
+    """Пробная проверка: может ли кодер закодировать тестовый кадр."""
+    try:
+        out = _run(
+            [
+                str(ffmpeg), "-hide_banner", "-v", "error",
+                "-f", "lavfi", "-i", "testsrc=size=160x90:rate=10:duration=0.5",
+                "-c:v", encoder, "-frames:v", "2", "-f", "null", _NULL_OUTPUT,
+            ],
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out.returncode == 0
+
+
+def usable_hw_encoders() -> set[str]:
+    """Аппаратные кодеры, реально работающие на этой машине.
+
+    Дорогой вызов (запускает тестовое кодирование) — предназначен для GUI,
+    который вызывает его один раз в фоновом потоке.
+    """
+    try:
+        ffmpeg, _ = _require_ffmpeg()
+    except VideoCompressorError:
+        return set()
+    listed = available_encoders()
+    return {enc for enc in listed if enc != "libx264" and _encoder_works(ffmpeg, enc)}
 
 
 # --------------------------------------------------------------------------- #
@@ -366,9 +462,19 @@ def build_plan(
     """Собрать план сжатия: битрейты и оценку итогового размера."""
     if target_size_mb <= 0:
         raise ValueError("Целевой размер должен быть положительным.")
-    audio_bps = info.audio_bitrate_bps if info.has_audio else 0
+    if info.duration_sec <= 0:
+        raise ValueError("Длительность файла должна быть положительной.")
     # Аудио не должно съедать больше 40% целевого бюджета.
-    audio_bps = min(audio_bps, int(target_size_mb * 8 * 1024 * 1024 * 0.4 / info.duration_sec))
+    audio_budget_bps = int(target_size_mb * 8 * 1024 * 1024 * 0.4 / info.duration_sec)
+    audio_orig = max(0, info.audio_bitrate_bps)
+    audio_copy = (
+        info.has_audio
+        and 0 < audio_orig <= audio_budget_bps
+        and (info.audio_codec or "") in MP4_AUDIO_COPY_CODECS
+    )
+    audio_bps = audio_orig if audio_copy else min(audio_orig, audio_budget_bps)
+    if not info.has_audio:
+        audio_bps = 0
     video_bps = compute_video_bitrate(
         target_size_mb, info.duration_sec, audio_bps, safety_factor=safety_factor
     )
@@ -377,7 +483,68 @@ def build_plan(
         video_bitrate_bps=video_bps,
         audio_bitrate_bps=audio_bps,
         estimated_size_mb=estimate_size_mb(info.duration_sec, video_bps, audio_bps),
+        audio_copy=audio_copy,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Разрешение
+# --------------------------------------------------------------------------- #
+
+
+def pick_target_height(
+    info: MediaInfo,
+    video_bitrate_bps: int,
+    *,
+    bits_per_pixel_target: float = TARGET_BITS_PER_PIXEL,
+) -> int | None:
+    """Автовыбор высоты под данный битрейт (``None`` — оставить исходную).
+
+    Если на исходном разрешении биты/пиксель в норме, масштабировать не нужно,
+    уменьшать без причины тоже не стоит. Если биты/пиксель недостаточно —
+    идём вниз по лестнице высот, пока на каждого пикселя не хватит битов.
+    """
+    if not (info.width and info.height and info.width > 0 and info.height > 0):
+        return None
+    fps = info.fps if info.fps and info.fps > 1 else 30.0
+    bpp = video_bitrate_bps / (info.width * info.height * fps)
+    if bpp >= bits_per_pixel_target:
+        return None
+    if info.height <= SCALE_LADDER[-1]:
+        return None  # источник сам по себе низкий — вниз некуда
+    lowest = None
+    for height in SCALE_LADDER:
+        if height >= info.height:
+            continue
+        ratio = height / info.height
+        width2 = int(info.width * ratio)
+        bpp2 = video_bitrate_bps / (width2 * height * fps)
+        lowest = height
+        if bpp2 >= bits_per_pixel_target:
+            return height
+    return lowest  # даже самая нижняя ступень лучше «каши» на полноразмере
+
+
+def _resolve_scale(
+    info: MediaInfo,
+    max_height: int | str | None,
+    video_bitrate_bps: int,
+) -> tuple[int, int] | None:
+    """Пара (ширина, высота) для фильтра scale или ``None``, если не нужно."""
+    if max_height is None:
+        return None
+    if not (info.width and info.height and info.width > 0 and info.height > 0):
+        return None
+    if max_height == "auto":
+        height = pick_target_height(info, video_bitrate_bps)
+    else:
+        height = int(max_height)
+    if not height or height >= info.height:
+        return None  # вверх не масштабируем
+    ratio = height / info.height
+    width2 = max(2, int(info.width * ratio) // 2 * 2)
+    height2 = max(2, height // 2 * 2)
+    return width2, height2
 
 
 # --------------------------------------------------------------------------- #
@@ -385,6 +552,7 @@ def build_plan(
 # --------------------------------------------------------------------------- #
 
 _OUT_TIME_RE = re.compile(r"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+_SPEED_RE = re.compile(r"speed=\s*([\d.]+)x")
 
 
 def _parse_progress_line(line: str) -> float | None:
@@ -396,6 +564,25 @@ def _parse_progress_line(line: str) -> float | None:
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
+def _parse_speed(line: str) -> float | None:
+    """Разобрать ``speed=1.37x`` из вывода ``-progress``."""
+    match = _SPEED_RE.match(line.strip())
+    return float(match.group(1)) if match else None
+
+
+def _video_args(encoder: str, preset: str) -> list[str]:
+    """Аргументы ``(кодек, пресет)`` для выбранного кодировщика."""
+    if encoder == "libx264":
+        return ["-c:v", "libx264", "-preset", preset]
+    if encoder == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", _HW_PRESETS["h264_nvenc"].get(preset, "p5")]
+    if encoder == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-preset", preset]
+    if encoder == "h264_amf":
+        return ["-c:v", "h264_amf", "-quality", _HW_PRESETS["h264_amf"].get(preset, "balanced")]
+    raise ValueError(f"Неизвестный кодировщик: {encoder!r}")
+
+
 def _encode_command(
     ffmpeg: Path,
     info: MediaInfo,
@@ -403,6 +590,11 @@ def _encode_command(
     plan: CompressionPlan,
     preset: str,
     audio: bool,
+    *,
+    encoder: str = "libx264",
+    scale: tuple[int, int] | None = None,
+    first_pass: bool = False,
+    pass_logfile: Path | None = None,
 ) -> list[str]:
     video_kbps = plan.video_bitrate_kbps
     cmd = [
@@ -410,20 +602,43 @@ def _encode_command(
         "-hide_banner",
         "-y",
         "-i", str(info.path),
-        "-c:v", "libx264",
-        "-preset", preset,
+    ]
+    if scale:
+        cmd += ["-vf", f"scale={scale[0]}:{scale[1]}:flags=lanczos"]
+    cmd += _video_args(encoder, preset)
+    cmd += [
         "-b:v", f"{video_kbps}k",
         "-maxrate", f"{int(video_kbps * 1.2)}k",
         "-bufsize", f"{video_kbps * 2}k",
         "-pix_fmt", "yuv420p",
         "-sn",
     ]
+    if first_pass:
+        # Первый проход двухпроходного режима: только анализ видео.
+        if pass_logfile is None:
+            raise ValueError("Первому проходу нужен путь passlogfile.")
+        cmd += ["-pass", "1", "-passlogfile", str(pass_logfile), "-an"]
+        cmd += ["-f", "null", _NULL_OUTPUT]
+        return cmd
+
     if audio and plan.audio_bitrate_bps > 0:
-        cmd += ["-c:a", "aac", "-b:a", f"{max(32, plan.audio_bitrate_bps // 1000)}k"]
+        if plan.audio_copy:
+            cmd += ["-c:a", "copy"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", f"{max(32, plan.audio_bitrate_bps // 1000)}k"]
     else:
         cmd += ["-an"]
+    if pass_logfile is not None:
+        cmd += ["-pass", "2", "-passlogfile", str(pass_logfile)]
     cmd += ["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output)]
     return cmd
+
+
+def _cleanup_pass_logs(base: Path) -> None:
+    """Удалить файлы статистики двухпроходного режима."""
+    with contextlib.suppress(OSError):
+        for stale in base.parent.glob(base.name + "*"):
+            stale.unlink(missing_ok=True)
 
 
 def _encode_once(
@@ -434,10 +649,36 @@ def _encode_once(
     preset: str,
     progress: ProgressCallback | None,
     cancel: threading.Event | None,
+    *,
+    encoder: str = "libx264",
+    scale: tuple[int, int] | None = None,
+    stage: str = "Кодирование",
+    two_pass: bool = False,
+    pass_number: int = 2,
+    pass_logfile: Path | None = None,
 ) -> None:
     """Один прогон FFmpeg. Бросает EncodeError или CompressionCancelled."""
-    cmd = _encode_command(ffmpeg, info, output, plan, preset, info.has_audio)
+    is_first_pass = two_pass and pass_number == 1 and pass_logfile is not None
+    cmd = _encode_command(
+        ffmpeg, info, output, plan, preset, info.has_audio,
+        encoder=encoder, scale=scale,
+        first_pass=is_first_pass, pass_logfile=pass_logfile,
+    )
     duration = info.duration_sec
+
+    # Диапазон прогресса этого прогона: в двухпроходном режиме проходы
+    # делят файл пополам — 0–0.5 и 0.5–1.
+    if two_pass and pass_number == 1:
+        offset, length = 0.0, 0.5
+    elif two_pass:
+        offset, length = 0.5, 0.5
+    else:
+        offset, length = 0.0, 1.0
+    if progress is not None:
+        def emit(video_frac: float, speed: float | None) -> None:
+            text = stage if speed is None else f"{stage} · {speed:g}×"
+            mapped = offset + max(0.0, min(video_frac, 1.0)) * length
+            progress(mapped, text)
 
     log.debug("Команда: %s", " ".join(cmd))
     proc = subprocess.Popen(
@@ -459,6 +700,7 @@ def _encode_once(
     threading.Thread(target=drain_stderr, daemon=True, name="ffmpeg-stderr").start()
 
     assert proc.stdout is not None
+    last_speed: float | None = None
     try:
         for raw_line in proc.stdout:
             if cancel is not None and cancel.is_set():
@@ -467,11 +709,16 @@ def _encode_once(
             if progress is None:
                 continue
             if raw_line.startswith("progress=end"):
-                progress(1.0, "Завершение")
+                emit(1.0, last_speed)
                 continue
             seconds = _parse_progress_line(raw_line)
-            if seconds is not None and duration > 0:
-                progress(min(seconds / duration, 0.999), "Кодирование")
+            if seconds is None:
+                speed = _parse_speed(raw_line)
+                if speed is not None:
+                    last_speed = speed
+                continue
+            if duration > 0:
+                emit(min(seconds / duration, 0.999), last_speed)
     finally:
         proc.stdout.close()
         returncode = proc.wait()
@@ -485,50 +732,60 @@ def _encode_once(
         raise EncodeError(f"FFmpeg завершился с ошибкой: {detail}")
 
 
-def compress(
-    input_path: str | Path,
-    output_path: str | Path,
-    target_size_mb: float = DEFAULT_TARGET_SIZE_MB,
+def _run_attempts(
+    ffmpeg: Path,
+    info: MediaInfo,
+    output_path: Path,
+    target_size_mb: float,
     *,
-    preset: str = "veryfast",
-    progress: ProgressCallback | None = None,
-    cancel: threading.Event | None = None,
-    max_attempts: int = MAX_ATTEMPTS,
+    preset: str,
+    encoder: str,
+    max_height: int | str | None,
+    two_pass: bool,
+    max_attempts: int,
+    progress: ProgressCallback | None,
+    cancel: threading.Event | None,
 ) -> CompressionResult:
-    """Сжать видео так, чтобы результат уложился в ``target_size_mb``.
-
-    Алгоритм: рассчитать битрейт, закодировать, проверить фактический размер;
-    если не влезли — повторить с пониженным битрейтом (до ``max_attempts`` раз).
-
-    Raises:
-        FfmpegNotFoundError / MediaInfoError / EncodeError / CompressionCancelled
-    """
-    input_path = Path(input_path)
-    output_path = Path(output_path)
-    if preset not in ENCODER_PRESETS:
-        raise ValueError(f"Неизвестный пресет: {preset!r}")
-    if target_size_mb <= 0:
-        raise ValueError("Целевой размер должен быть положительным.")
-
-    ffmpeg, _ = _require_ffmpeg()
-    info = probe(input_path)
-    if output_path.resolve() == input_path.resolve():
-        raise EncodeError("Выходной файл совпадает с входным.")
-
+    """Цикл попыток: кодирование и пересчёт битрейта, если не влезли в лимит."""
     plan = build_plan(info, target_size_mb)
+    current_plan = plan
     log.info(
-        "Цель %.2f МБ | видеобитрейт %d кбит/с | оценка %.2f МБ",
-        target_size_mb, plan.video_bitrate_kbps, plan.estimated_size_mb,
+        "Цель %.2f МБ | видеобитрейт %d кбит/с | аудио %s | оценка %.2f МБ",
+        target_size_mb,
+        plan.video_bitrate_kbps,
+        "копия" if plan.audio_copy else f"{plan.audio_bitrate_bps // 1000} кбит/с",
+        plan.estimated_size_mb,
     )
 
+    pass_logfile = None
+    if two_pass:
+        pass_logfile = Path(tempfile.gettempdir()) / f"vc_pass_{uuid.uuid4().hex}"
+
     attempts = 0
-    current_plan = plan
     try:
         while True:
             attempts += 1
+            scale = _resolve_scale(info, max_height, current_plan.video_bitrate_bps)
+            scale_note = f" · масштаб {scale[0]}×{scale[1]}" if scale else ""
+            stage = f"Кодирование (попытка {attempts}/{max_attempts}){scale_note}"
             if progress:
-                progress(0.0, f"Кодирование (попытка {attempts}/{max_attempts})")
-            _encode_once(ffmpeg, info, output_path, current_plan, preset, progress, cancel)
+                progress(0.0, stage)
+            if two_pass:
+                _encode_once(
+                    ffmpeg, info, output_path, current_plan, preset, progress, cancel,
+                    encoder=encoder, scale=scale, two_pass=True, pass_number=1,
+                    pass_logfile=pass_logfile, stage=f"Проход 1/2 · {stage}",
+                )
+                _encode_once(
+                    ffmpeg, info, output_path, current_plan, preset, progress, cancel,
+                    encoder=encoder, scale=scale, two_pass=True, pass_number=2,
+                    pass_logfile=pass_logfile, stage=f"Проход 2/2 · {stage}",
+                )
+            else:
+                _encode_once(
+                    ffmpeg, info, output_path, current_plan, preset, progress, cancel,
+                    encoder=encoder, scale=scale, stage=stage,
+                )
 
             actual_mb = output_path.stat().st_size / (1024 * 1024)
             log.info(
@@ -554,22 +811,108 @@ def compress(
                 video_bitrate_bps=video_bps,
                 audio_bitrate_bps=audio_bps,
                 estimated_size_mb=estimate_size_mb(info.duration_sec, video_bps, audio_bps),
+                audio_copy=current_plan.audio_copy,
             )
             if progress:
                 progress(0.0, f"Пересчёт битрейта (попытка {attempts + 1}/{max_attempts})")
+
+        return CompressionResult(
+            input_path=info.path,
+            output_path=output_path,
+            target_size_mb=target_size_mb,
+            actual_size_mb=actual_mb,
+            plan=current_plan,
+            attempts=attempts,
+            encoder=encoder,
+            output_height=scale[1] if scale else None,
+        )
     except BaseException:
         # Отмена или ошибка — не оставляем недописанный файл.
         output_path.unlink(missing_ok=True)
         raise
+    finally:
+        if pass_logfile is not None:
+            _cleanup_pass_logs(pass_logfile)
 
-    return CompressionResult(
-        input_path=input_path,
-        output_path=output_path,
-        target_size_mb=target_size_mb,
-        actual_size_mb=actual_mb,
-        plan=current_plan,
-        attempts=attempts,
-    )
+
+def compress(
+    input_path: str | Path,
+    output_path: str | Path,
+    target_size_mb: float = DEFAULT_TARGET_SIZE_MB,
+    *,
+    preset: str = "veryfast",
+    encoder: str = "libx264",
+    max_height: int | str | None = None,
+    two_pass: bool = False,
+    info: MediaInfo | None = None,
+    progress: ProgressCallback | None = None,
+    cancel: threading.Event | None = None,
+    max_attempts: int = MAX_ATTEMPTS,
+) -> CompressionResult:
+    """Сжать видео так, чтобы результат уложился в ``target_size_mb``.
+
+    Алгоритм: рассчитать битрейт, закодировать, проверить фактический размер;
+    если не влезли — повторить с пониженным битрейтом (до ``max_attempts`` раз).
+
+    Args:
+        encoder: ``libx264`` или аппаратный (``h264_nvenc``, ``h264_qsv``,
+            ``h264_amf``); при сбое аппаратного кодера выполняется
+            автоматический повтор через libx264.
+        max_height: ``None`` — оставить исходное разрешение; ``"auto"`` —
+            выбирать высоту по битрейту; число — ограничение сверху
+            (апскейла нет). Пересматривается после каждой попытки.
+        two_pass: двухпроходное кодирование (только libx264) — результат
+            точнее попадает в целевой размер, но занимает вдвое больше времени.
+        info: заранее прочитанные данные ffprobe; если ``None`` — читаются сами.
+
+    Raises:
+        FfmpegNotFoundError / MediaInfoError / EncodeError / CompressionCancelled
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    if preset not in ENCODER_PRESETS:
+        raise ValueError(f"Неизвестный пресет: {preset!r}")
+    if encoder not in ENCODERS:
+        raise ValueError(f"Неизвестный кодировщик: {encoder!r}")
+    if target_size_mb <= 0:
+        raise ValueError("Целевой размер должен быть положительным.")
+    if max_height is not None and max_height != "auto":
+        if isinstance(max_height, str) or int(max_height) <= 0:
+            raise ValueError("max_height: None, 'auto' или положительное число.")
+        max_height = int(max_height)
+
+    ffmpeg, _ = _require_ffmpeg()
+    if info is None:
+        info = probe(input_path)
+    if output_path.resolve() == input_path.resolve():
+        raise EncodeError("Выходной файл совпадает с входным.")
+
+    # Аппаратные кодеры не понимают статистику 2-pass от x264.
+    if two_pass and encoder != "libx264":
+        log.info("Двухпроходное кодирование поддерживает только libx264 — кодирую в один проход.")
+        two_pass = False
+
+    kwargs: dict = {
+        "preset": preset,
+        "encoder": encoder,
+        "max_height": max_height,
+        "two_pass": two_pass,
+        "max_attempts": max_attempts,
+        "progress": progress,
+        "cancel": cancel,
+    }
+    try:
+        return _run_attempts(ffmpeg, info, output_path, target_size_mb, **kwargs)
+    except EncodeError as exc:
+        cancelled = cancel is not None and cancel.is_set()
+        if encoder != "libx264" and not cancelled:
+            log.warning(
+                "Кодировщик %s не сработал (%s) — повторяю через libx264.", encoder, exc
+            )
+            return _run_attempts(
+                ffmpeg, info, output_path, target_size_mb, **{**kwargs, "encoder": "libx264"}
+            )
+        raise
 
 
 def default_output_path(input_path: str | Path) -> Path:
